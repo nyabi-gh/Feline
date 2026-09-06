@@ -155,7 +155,9 @@ impl E621Core {
         cache_dir: Option<String>,
     ) -> Result<Arc<Self>, FfiError> {
         let creds = credentials.map(Into::into);
-        let limiter = new_api_limiter();
+        static LIMITER: std::sync::OnceLock<Arc<crate::e621::rate_limit::ApiLimiter>> =
+            std::sync::OnceLock::new();
+        let limiter = LIMITER.get_or_init(new_api_limiter).clone();
         let file_root = cache_dir
             .as_deref()
             .map(prepare_file_root)

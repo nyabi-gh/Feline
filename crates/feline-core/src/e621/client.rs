@@ -387,6 +387,14 @@ impl Client {
 }
 
 fn expected_md5_from_url(url: &url::Url) -> Option<String> {
+    // CDN derivatives reuse the original filename hash but have different bytes.
+    let segments: Vec<_> = url.path_segments()?.collect();
+    if segments
+        .iter()
+        .any(|segment| matches!(*segment, "preview" | "sample" | "samples" | "alternates"))
+    {
+        return None;
+    }
     let last = url.path_segments()?.next_back()?;
     let stem = last.split('.').next()?;
     if stem.len() == 32 && stem.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -548,6 +556,18 @@ mod tests {
         assert!(!is_allowed_media_host("example.com"));
         assert!(!is_allowed_media_host("cdn.static1.e621.net"));
         assert!(!is_allowed_media_host("e621.net.evil.com"));
+    }
+
+    #[test]
+    fn derivative_filenames_do_not_claim_original_checksum() {
+        let md5 = "0123456789abcdef0123456789abcdef";
+        for kind in ["preview", "sample", "samples", "alternates"] {
+            let url = url::Url::parse(&format!(
+                "https://static1.e621.net/data/{kind}/01/23/{md5}.jpg"
+            ))
+            .unwrap();
+            assert_eq!(expected_md5_from_url(&url), None);
+        }
     }
 
     #[test]
