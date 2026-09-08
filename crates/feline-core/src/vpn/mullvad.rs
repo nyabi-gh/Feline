@@ -22,7 +22,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const USER_AGENT_VALUE: &str = concat!(
     "Feline/",
     env!("CARGO_PKG_VERSION"),
-    " (https://github.com/nyattic/Feline)"
+    " (https://github.com/nyabi-gh/Feline)"
 );
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
