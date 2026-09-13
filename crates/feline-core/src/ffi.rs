@@ -46,6 +46,25 @@ pub struct FfiResponse {
     pub body: Vec<u8>,
 }
 
+/// One byte window of a media file plus what the server said about the whole
+/// resource, so a player can start before the download finishes.
+#[derive(uniffi::Record)]
+pub struct FfiRangeResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub total_length: Option<u64>,
+    pub content_type: Option<String>,
+    pub accepts_ranges: bool,
+}
+
+/// Download progress reported while bytes arrive. `total` is 0 until the
+/// server announces a length. Implementations must return promptly; the
+/// download thread is blocked for the duration of the call.
+#[uniffi::export(callback_interface)]
+pub trait DownloadProgress: Send + Sync {
+    fn on_progress(&self, downloaded: u64, total: u64);
+}
+
 #[derive(uniffi::Record)]
 pub struct FfiQueryParam {
     pub key: String,
@@ -201,11 +220,41 @@ impl E621Core {
         })
     }
 
-    pub async fn download_to_file(&self, url: String, dest_path: String) -> Result<u16, FfiError> {
+    pub async fn fetch_media_range(
+        &self,
+        url: String,
+        start: u64,
+        length: Option<u64>,
+    ) -> Result<FfiRangeResponse, FfiError> {
+        let resp = self
+            .inner
+            .fetch_media_range(&url, start, length)
+            .await
+            .map_err(FfiError::from)?;
+        Ok(FfiRangeResponse {
+            status: resp.status,
+            body: resp.body,
+            total_length: resp.total_length,
+            content_type: resp.content_type,
+            accepts_ranges: resp.accepts_ranges,
+        })
+    }
+
+    pub async fn download_to_file(
+        &self,
+        url: String,
+        dest_path: String,
+        progress: Option<Box<dyn DownloadProgress>>,
+    ) -> Result<u16, FfiError> {
         let dest_path = scoped_file_path(self.file_root.as_deref(), &dest_path)?;
         let dest_path = dest_path.to_string_lossy().into_owned();
+        let sink = progress.map(|sink| {
+            let boxed: Box<dyn Fn(u64, u64) + Send + Sync> =
+                Box::new(move |downloaded, total| sink.on_progress(downloaded, total));
+            boxed
+        });
         self.inner
-            .download_to_file(&url, &dest_path)
+            .download_to_file(&url, &dest_path, sink.as_deref())
             .await
             .map_err(FfiError::from)
     }

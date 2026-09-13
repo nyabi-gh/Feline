@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use wreq::header::{ACCEPT, ACCEPT_LANGUAGE, HeaderMap, HeaderValue, USER_AGENT};
+use wreq::header::{
+    ACCEPT, ACCEPT_LANGUAGE, ACCEPT_RANGES, CONTENT_RANGE, CONTENT_TYPE, HeaderMap, HeaderValue,
+    RANGE, USER_AGENT,
+};
 use wreq_util::Profile;
 
 use super::rate_limit::{ApiLimiter, new_api_limiter};
@@ -21,14 +24,32 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_API_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_MEDIA_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
+/// Upper bound on a single range slice. Players ask for small windows;
+/// this only keeps a misbehaving server from filling memory.
+pub const MAX_RANGE_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 
 pub const SESSION_EXPIRED: &str = "Your session expired. Sign in again.";
 
 static DOWNLOAD_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Minimum gap between download progress reports. Every chunk would mean
+/// thousands of foreign calls for one file.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+const CACHE_PREALLOC_BYTES: u64 = 8 * 1024 * 1024;
+
 pub struct RawResponse {
     pub status: u16,
     pub body: Vec<u8>,
+}
+
+/// One byte window of a media file, plus what the server said about the whole
+/// resource. Streaming players need the total size before they can seek.
+pub struct RangeResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub total_length: Option<u64>,
+    pub content_type: Option<String>,
+    pub accepts_ranges: bool,
 }
 
 struct DownloadTempFile {
@@ -307,7 +328,97 @@ impl Client {
         })
     }
 
-    pub async fn download_to_file(&self, url: &str, dest_path: &str) -> Result<u16> {
+    /// Fetch a byte window of a media file so a player can start before the
+    /// whole file has arrived. Ranged bytes cannot be checksummed, so this is
+    /// for playback only; `download_to_file` still verifies what it keeps.
+    pub async fn fetch_media_range(
+        &self,
+        url: &str,
+        start: u64,
+        length: Option<u64>,
+    ) -> Result<RangeResponse> {
+        let parsed = url::Url::parse(url).context("invalid media URL")?;
+        if parsed.scheme() != "https" {
+            anyhow::bail!("media URL must use https");
+        }
+        let host = parsed.host_str().unwrap_or_default().to_string();
+        if !is_allowed_media_host(&host) {
+            anyhow::bail!("media host not allowed: {host}");
+        }
+
+        let want = length
+            .filter(|value| *value > 0)
+            .unwrap_or(MAX_RANGE_CHUNK_BYTES)
+            .min(MAX_RANGE_CHUNK_BYTES);
+        let header = match start.checked_add(want - 1) {
+            Some(last) => format!("bytes={start}-{last}"),
+            None => format!("bytes={start}-"),
+        };
+
+        let mut req = self.download_http.get(parsed.as_str()).header(RANGE, header);
+        if host_accepts_credentials(&host, self.site.credential_domains()) {
+            self.limiter.until_ready().await;
+            req = self.apply_auth(req);
+        }
+
+        let resp = req.send().await.context("send media range request")?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Ok(RangeResponse {
+                status,
+                body: Vec::new(),
+                total_length: None,
+                content_type: None,
+                accepts_ranges: false,
+            });
+        }
+
+        let headers = resp.headers().clone();
+        let partial = status == 206;
+        let total_length = if partial {
+            content_range_total(&headers)
+        } else {
+            parse_content_length(&headers)
+        };
+        let content_type = headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let accepts_ranges = partial
+            || headers
+                .get(ACCEPT_RANGES)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.eq_ignore_ascii_case("bytes"));
+
+        // A server that ignores `Range` answers 200 with the whole file. Walk
+        // the stream to the requested offset instead of buffering all of it.
+        let mut window = RangeWindow::new(if partial { 0 } else { start }, want);
+        let mut stream = resp.bytes_stream();
+        while !window.is_full() {
+            let Some(chunk) = stream.next().await else { break };
+            window.take(chunk.context("read media chunk")?.as_ref());
+        }
+        drop(stream);
+        let body = window.into_body();
+
+        Ok(RangeResponse {
+            status,
+            body,
+            total_length,
+            content_type,
+            accepts_ranges,
+        })
+    }
+
+    /// Download a whole file and verify it before committing it to `dest_path`.
+    /// `progress` is called with (downloaded, total) while bytes arrive; total
+    /// is 0 until the server reports a length.
+    pub async fn download_to_file(
+        &self,
+        url: &str,
+        dest_path: &str,
+        progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+    ) -> Result<u16> {
         use md5::{Digest, Md5};
         use tokio::io::AsyncWriteExt;
 
@@ -318,6 +429,40 @@ impl Client {
         let host = parsed.host_str().unwrap_or_default().to_string();
         if !is_allowed_media_host(&host) {
             anyhow::bail!("media host not allowed: {host}");
+        }
+
+        let expected_md5 = expected_md5_from_url(&parsed);
+        let cacheable = media_cache::is_cacheable_url(url);
+        let dest_path = Path::new(dest_path);
+        let seq = DOWNLOAD_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let name = dest_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("download");
+        let tmp_path =
+            dest_path.with_file_name(format!(".{name}.{}.{seq}.part", std::process::id()));
+        let mut tmp_file = DownloadTempFile::new(tmp_path.clone());
+
+        // A file the viewer already fetched is worth reusing, but only when its
+        // bytes still match the checksum in the URL. The cache itself is filled
+        // without verification, so an unverifiable entry is refetched instead.
+        if cacheable
+            && let Some(dir) = &self.cache_dir
+            && let Some(bytes) = media_cache::read(dir, url)
+            && cached_bytes_match(&bytes, expected_md5.as_deref())
+        {
+            let total = bytes.len() as u64;
+            if let Some(report) = progress {
+                report(total, total);
+            }
+            tokio::fs::write(&tmp_path, &bytes)
+                .await
+                .context("write cached media file")?;
+            tokio::fs::rename(&tmp_path, dest_path)
+                .await
+                .context("commit destination file")?;
+            tmp_file.disarm();
+            return Ok(200);
         }
 
         let mut req = self.download_http.get(parsed.as_str());
@@ -332,41 +477,52 @@ impl Client {
             return Ok(status);
         }
 
-        if let Some(length) = parse_content_length(resp.headers())
+        let announced = parse_content_length(resp.headers());
+        if let Some(length) = announced
             && length > MAX_DOWNLOAD_BYTES
         {
             anyhow::bail!("file is too large to download ({length} bytes)");
         }
-
-        let expected_md5 = expected_md5_from_url(&parsed);
-
-        let dest_path = Path::new(dest_path);
-        let seq = DOWNLOAD_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let name = dest_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("download");
-        let tmp_path =
-            dest_path.with_file_name(format!(".{name}.{}.{seq}.part", std::process::id()));
-        let mut tmp_file = DownloadTempFile::new(tmp_path.clone());
+        let total = announced.unwrap_or(0);
+        if let Some(report) = progress {
+            report(0, total);
+        }
 
         let mut file = tokio::fs::File::create(&tmp_path)
             .await
             .context("create temporary destination file")?;
         let mut hasher = expected_md5.as_ref().map(|_| Md5::new());
-        let mut total: u64 = 0;
+        let mut keep: Option<Vec<u8>> = if cacheable && self.cache_dir.is_some() {
+            Some(Vec::with_capacity(total.min(CACHE_PREALLOC_BYTES) as usize))
+        } else {
+            None
+        };
+        let mut downloaded: u64 = 0;
+        let mut last_report = std::time::Instant::now();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("read media chunk")?;
-            total = total.saturating_add(chunk.len() as u64);
-            if total > MAX_DOWNLOAD_BYTES {
+            downloaded = downloaded.saturating_add(chunk.len() as u64);
+            if downloaded > MAX_DOWNLOAD_BYTES {
                 drop(file);
                 anyhow::bail!("file exceeds download cap of {MAX_DOWNLOAD_BYTES} bytes; aborted");
             }
             if let Some(h) = hasher.as_mut() {
                 h.update(&chunk);
             }
+            match keep.as_mut() {
+                Some(buffer) if downloaded <= MAX_CACHE_BYTES => buffer.extend_from_slice(&chunk),
+                Some(_) => keep = None,
+                None => {}
+            }
             file.write_all(&chunk).await.context("write media chunk")?;
+            // Reporting every chunk would cross the FFI thousands of times.
+            if let Some(report) = progress
+                && last_report.elapsed() >= PROGRESS_INTERVAL
+            {
+                last_report = std::time::Instant::now();
+                report(downloaded, total.max(downloaded));
+            }
         }
         file.flush().await.context("flush media file")?;
         file.sync_all().await.context("sync media file")?;
@@ -378,10 +534,16 @@ impl Client {
                 anyhow::bail!("md5 mismatch: expected {expected}, got {actual}");
             }
         }
+        if let (Some(dir), Some(bytes)) = (&self.cache_dir, keep) {
+            let _ = media_cache::write(dir, url, &bytes, MAX_CACHE_BYTES);
+        }
         tokio::fs::rename(&tmp_path, dest_path)
             .await
             .context("commit destination file")?;
         tmp_file.disarm();
+        if let Some(report) = progress {
+            report(downloaded, downloaded);
+        }
         Ok(status)
     }
 }
@@ -428,10 +590,12 @@ fn build_download_wreq(user_agent: &str, proxy_url: Option<&str>) -> Result<wreq
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_str(user_agent)?);
 
+    // A whole-request deadline would kill any download that legitimately runs
+    // long over a tunnel. Bound inactivity instead.
     let mut builder = wreq::Client::builder()
         .emulation(EMULATION_PROFILE)
         .default_headers(headers)
-        .timeout(Duration::from_secs(60))
+        .read_timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(15));
     if let Some(url) = proxy_url {
         let proxy = wreq::Proxy::all(url).context("configure SOCKS5 proxy")?;
@@ -458,6 +622,61 @@ fn search_params(full_query: String, before_id: Option<u64>) -> Vec<(&'static st
         params.push(("page", format!("b{id}")));
     }
     params
+}
+
+/// Collects exactly the requested window out of a response body, skipping any
+/// leading bytes a server sent because it ignored the `Range` header.
+struct RangeWindow {
+    skip: u64,
+    want: u64,
+    body: Vec<u8>,
+}
+
+impl RangeWindow {
+    fn new(skip: u64, want: u64) -> Self {
+        Self {
+            skip,
+            want,
+            body: Vec::new(),
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.body.len() as u64 >= self.want
+    }
+
+    fn take(&mut self, chunk: &[u8]) {
+        let skipped = (self.skip as usize).min(chunk.len());
+        self.skip -= skipped as u64;
+        let slice = &chunk[skipped..];
+        if slice.is_empty() {
+            return;
+        }
+        let remaining = (self.want - self.body.len() as u64) as usize;
+        self.body.extend_from_slice(&slice[..remaining.min(slice.len())]);
+    }
+
+    fn into_body(self) -> Vec<u8> {
+        self.body
+    }
+}
+
+fn content_range_total(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit('/').next())
+        .map(str::trim)
+        .filter(|total| *total != "*")
+        .and_then(|total| total.parse::<u64>().ok())
+}
+
+fn cached_bytes_match(bytes: &[u8], expected_md5: Option<&str>) -> bool {
+    use md5::{Digest, Md5};
+    let Some(expected) = expected_md5 else {
+        return false;
+    };
+    hex::encode(Md5::digest(bytes)) == expected
 }
 
 fn parse_content_length(headers: &wreq::header::HeaderMap) -> Option<u64> {
@@ -556,6 +775,58 @@ mod tests {
         assert!(!is_allowed_media_host("example.com"));
         assert!(!is_allowed_media_host("cdn.static1.e621.net"));
         assert!(!is_allowed_media_host("e621.net.evil.com"));
+    }
+
+    #[test]
+    fn a_partial_response_is_taken_whole() {
+        let mut window = RangeWindow::new(0, 4);
+        window.take(b"ab");
+        assert!(!window.is_full());
+        window.take(b"cd");
+        assert!(window.is_full());
+        assert_eq!(window.into_body(), b"abcd");
+    }
+
+    #[test]
+    fn a_server_that_ignores_range_is_walked_to_the_offset() {
+        // 200 with the whole file: skip to byte 3, keep 4, drop the tail.
+        let mut window = RangeWindow::new(3, 4);
+        window.take(b"ab");
+        window.take(b"cdef");
+        window.take(b"ghij");
+        assert!(window.is_full());
+        assert_eq!(window.into_body(), b"defg");
+    }
+
+    #[test]
+    fn a_short_response_yields_what_arrived() {
+        let mut window = RangeWindow::new(0, 16);
+        window.take(b"tail");
+        assert!(!window.is_full());
+        assert_eq!(window.into_body(), b"tail");
+    }
+
+    #[test]
+    fn content_range_total_reads_the_resource_size() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 0-1023/8192"));
+        assert_eq!(content_range_total(&headers), Some(8192));
+
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 0-1023/*"));
+        assert_eq!(content_range_total(&headers), None);
+
+        assert_eq!(content_range_total(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn cached_bytes_are_only_reused_when_the_checksum_matches() {
+        use md5::{Digest, Md5};
+        let bytes = b"prism";
+        let md5 = hex::encode(Md5::digest(bytes));
+        assert!(cached_bytes_match(bytes, Some(&md5)));
+        assert!(!cached_bytes_match(bytes, Some("0123456789abcdef0123456789abcdef")));
+        // A derivative URL carries no usable checksum, so it is never reused.
+        assert!(!cached_bytes_match(bytes, None));
     }
 
     #[test]
